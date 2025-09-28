@@ -2,12 +2,21 @@ import os
 import logging
 import argparse
 import signal
-from scapy.all import IFACES, sniff, get_if_addr
+from scapy.all import IFACES, sniff, get_if_addr,bind_layers
+from scapy.packet import Packet
 from scapy.layers.isakmp import ISAKMP
+from scapy.layers.inet import IP,UDP
+from scapy.layers.inet6 import IPv6
+from scapy.contrib.wireguard import Wireguard
 import subprocess
 import platform
 import sys
+import time
 
+bind_layers(UDP, Wireguard)
+send_to_vpn_time = 0.0
+is_waiting_for_response = False
+TIMEOUT_THRESHOLD = 0.1
 system = platform.system()
 def alert_crash(exc_type, exc_value, exc_traceback):
     logging.fatal("CRASH DETECTED", exc_info=(exc_type, exc_value, exc_traceback))
@@ -79,19 +88,49 @@ def bring_interfaces_down():
             logging.fatal(f"[FAIL] {cmd}")
     logging.info("All interfaces disabled. Run 'protonswitch up' to restore.")
 
-def packet_callback(packet):
-    global stop_sniffing
-    if not packet.haslayer(ISAKMP):
-        return
-    isakmp_layer = packet[ISAKMP]
-    print(isakmp_layer.default_fields)
-    if isakmp_layer.default_fields['next_payload'] != 0:
-        logging.info(f"[SKIPPED] Next Payload is {isakmp_layer.next_payload}, not 0. Ignoring packet.")
-        return  # Skip if not 0
+def packet_callback(packet:Packet):
+    global stop_sniffing, send_to_vpn_time, is_waiting_for_response
+    current_time = time.time()
     logging.info(f"[PACKET DETECTED]: {packet.summary()}")
-    print(f"\nISAKMP Packet Detected: {packet.summary()}")
-    bring_interfaces_down()
-    stop_sniffing = True
+    print(f"\nPacket Detected: {packet.summary()}")
+    if not (packet.haslayer(ISAKMP) or packet.haslayer(Wireguard)):
+        return
+    if packet.haslayer(ISAKMP) and protocol == 'ISAKMP':
+        isakmp_layer = packet[ISAKMP]
+        print(isakmp_layer.default_fields)
+        if isakmp_layer.default_fields['next_payload'] != 0:
+            logging.info(f"[SKIPPED] Next Payload is {isakmp_layer.next_payload}, not 0. Ignoring packet.")
+            return  # Skip if not 0
+        bring_interfaces_down()
+        stop_sniffing = True
+
+
+    if packet.haslayer(Wireguard) and protocol == 'WIREGUARD':
+        ip_layer:IP|IPv6|None = None
+        if packet.haslayer(IP):
+            ip_layer = packet[IP]
+        elif packet.haslayer(IPv6):
+            ip_layer = packet[IPv6]
+        else:
+            return
+        src_ip = ip_layer.src
+        dst_ip = ip_layer.dst
+        logging.info(f"[WIREGUARD] src={src_ip} dst={dst_ip}")
+        if src_ip == my_ip and dst_ip == vpn_ip:
+            if not is_waiting_for_response:
+                current_time = time.time()
+                send_to_vpn_time = current_time
+                is_waiting_for_response = True
+                logging.info("[TIMER STARTED] First request sent to VPN server. Waiting for response...")
+            else:
+                logging.info("[IGNORED] Additional request while waiting for response.")
+        elif src_ip == vpn_ip and dst_ip == my_ip:
+            if is_waiting_for_response:
+                is_waiting_for_response = False
+                send_to_vpn_time = 0.0
+                logging.info("[TIMER RESET] Response received from VPN server.")
+            else:
+                logging.info("Unsolicited response from VPN server (no pending request).")
 
 
 
@@ -103,17 +142,20 @@ def is_process_running(pid):
     except OSError:
         return False
 
-def start_sniffing_daemon(vpn_ip, iface):
-
+def start_sniffing_daemon(iface):
+    logging.info("[FUNCTION EXECUTING] Start_sniffing_daemon...")
+    global my_ip, protocol, stop_sniffing, is_waiting_for_response
     my_ip = get_if_addr(iface)
     if not my_ip:
         logging.error(f"Could not get IP for interface {iface}")
         print(f"Could not get IP for interface {iface}")
         sys.exit(1)
-
-    bpf_filter = f"src host {vpn_ip} and dst host {my_ip} and udp and (port 500 or port 4500)"
+    if protocol.upper() == 'ISAKMP':
+        bpf_filter = f"src host {vpn_ip} and dst host {my_ip} and udp and (port 500 or port 4500)"
+    elif protocol.upper() == 'WIREGUARD':
+        bpf_filter = f"udp"
     logging.info(f"Applied filter: {bpf_filter}")
-    print(f"Starting daemon mode on {iface} for VPN IP {vpn_ip}")
+    print(f"Starting daemon mode on {iface} for VPN IP {vpn_ip} and protocol {protocol}")
     print("Logs written to kill.log")
     print("To stop: protonswitch off")
 
@@ -149,7 +191,8 @@ def start_sniffing_daemon(vpn_ip, iface):
 
     signal.signal(signal.SIGTERM, stop_handler)
     signal.signal(signal.SIGINT, stop_handler)
-
+    print("bpf filter:", bpf_filter)
+    SNIFF_TIMEOUT = 0.5
     try:
         while not stop_sniffing:
             sniff(
@@ -157,16 +200,25 @@ def start_sniffing_daemon(vpn_ip, iface):
                 prn=packet_callback,
                 store=False,
                 iface=iface,
-                timeout=1,
+                timeout=SNIFF_TIMEOUT,
                 stop_filter=lambda x: stop_sniffing
             )
+
+            if is_waiting_for_response and protocol.upper() == 'WIREGUARD':
+                elapsed = time.time() - send_to_vpn_time
+                if int(elapsed * 2) % 1 == 0:
+                    logging.info(f"[TIMER CHECK] Elapsed: {elapsed:.2f}s")
+                if elapsed > TIMEOUT_THRESHOLD:
+                    logging.warning(f"[TIMEOUT TRIGGERED] No response for {elapsed:.2f}s!")
+                    bring_interfaces_down()
+                    stop_sniffing = True
     except KeyboardInterrupt:
         pass
     finally:
         print("\nDaemon stopped gracefully.")
 
-
-
+def monitor_timeout():
+    ""
 def main():
     parser = argparse.ArgumentParser(
         description="ProtonSwitch Daemon: Monitor ISAKMP packets in background.",
@@ -174,6 +226,7 @@ def main():
     )
     parser.add_argument('mode', choices=['on', 'off', 'up'], help="Mode: on=start daemon, off=stop daemon, up=restore interfaces")
     parser.add_argument('vpn_ip', nargs='?', default=None, help="VPN server IP (required for 'on')")
+    parser.add_argument('protocol', nargs='?', default=None, help="wireguard or isakmp (required for 'on')")
     parser.add_argument('iface', nargs='?', default=None, help="Interface to capture on (required for 'on')")
 
     args = parser.parse_args()
@@ -181,11 +234,14 @@ def main():
     if args.mode == 'up':
         bring_interfaces_up()
     elif args.mode == 'on':
-        if not args.vpn_ip or not args.iface:
-            print("Error: VPN_IP and INTERFACE are required for 'on' mode.")
+        if not args.vpn_ip or not args.iface or not args.protocol:
+            print("Error: VPN_IP and Protocol and INTERFACE are required for 'on' mode.")
             parser.print_help()
             sys.exit(1)
-        start_sniffing_daemon(args.vpn_ip, args.iface)
+        global vpn_ip, protocol
+        vpn_ip = args.vpn_ip.strip()
+        protocol = args.protocol.strip()
+        start_sniffing_daemon(args.iface)
 
 if __name__ == "__main__":
     main()
