@@ -1,8 +1,10 @@
 ## Initial setup
-```git clone <url>
+```
+git clone <url>
 python3 -m venv env 
 source env/bin/activate
-pip install -r requirements.txt```
+pip install -r requirements.txt
+```
 
 To identify iface name, use wireshark 
 Make sure protonvpn protol to be set IKEv2
