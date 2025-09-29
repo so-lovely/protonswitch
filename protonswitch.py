@@ -16,15 +16,14 @@ import ipaddress
 import threading
 
 
-bind_layers(UDP, Wireguard)
 send_to_vpn_time = 0.0
 is_waiting_for_response = False
-TIMEOUT_THRESHOLD = 5
+TIMEOUT_THRESHOLD = 3
 system = platform.system()
 protocol = ""
 vpn_ip = None
 my_ip = None
-
+state_lock = threading.Lock()
 def alert_user(message="ProtonSwitch Crashed or interrupted. Restart again."):
     global stop_sniffing
     stop_sniffing = True
@@ -103,63 +102,85 @@ def bring_interfaces_down():
             logging.fatal(f"[FAIL] {cmd}")
     logging.info("All interfaces disabled. Run 'protonswitch up' to restore.")
 
-def packet_callback(packet:Packet):
-    global stop_sniffing, send_to_vpn_time, is_waiting_for_response
-    current_time = time.time()
-    summary = packet.summary()
-    summary_protocol = summary.split('/')[3].strip().upper()
-    udp_payload:Packet = packet[UDP]
-    payload = udp_payload.payload
-    raw_bytes = bytes(payload.load)
-    first_byte = raw_bytes[0]
-    is_wireguard:bool = first_byte in (1,2,3,4)
-    ip_layer:IP|IPv6|None = None
-    if packet.haslayer(IP):
-        ip_layer = packet[IP]
-    elif packet.haslayer(IPv6):
-        ip_layer = packet[IPv6]
-    else:
-        return
-    src_ip = ip_layer.src
-    dst_ip = ip_layer.dst
-    logging.info(f"[UDP RAW PAYLOAD FIRST 8 BYTES (HEX)]: {raw_bytes[:8].hex(' ')}")
-    logging.info(f"[PACKET DETECTED]: summary {summary}")
-    logging.info(f"[PACKET DETECTED PROTOCOL]: {summary_protocol}")
-    if not (summary_protocol == 'ISAKMP' or is_wireguard):
-        return
-    if summary_protocol == 'ISAKMP' and is_same_subnet(src_ip,vpn_ip):
-        isakmp_layer = packet[ISAKMP]
-        print(isakmp_layer.default_fields)
-        if isakmp_layer.default_fields['next_payload'] != 0:
-            logging.info(f"[SKIPPED] Next Payload is {isakmp_layer.next_payload}, not 0. Ignoring packet.")
-            return  # Skip if not 0
-        bring_interfaces_down()
-        stop_sniffing = True
+def packet_callback(packet):
+    global stop_sniffing
 
-    if is_wireguard:
-        global protocol
-        protocol = "WIREGUARD"
-        logging.info("[WIREGUARD DETECTED]")
-        logging.info(f"[WIREGUARD] src={src_ip} dst={dst_ip}")
-        
-        if src_ip == my_ip and is_same_subnet(dst_ip, vpn_ip):
-            if not is_waiting_for_response:
-                current_time = time.time()
-                send_to_vpn_time = current_time
-                is_waiting_for_response = True
-                logging.info("[TIMER STARTED] First request sent to VPN server. Waiting for response...")
-            else:
-                logging.info("[IGNORED] Additional request while waiting for response.")
-        elif is_same_subnet(src_ip, vpn_ip) and dst_ip == my_ip:
-            if is_waiting_for_response:
-                is_waiting_for_response = False
-                send_to_vpn_time = 0.0
-                logging.info("[TIMER RESET] Response received from VPN server.")
-            else:
-                logging.info("Unsolicited response from VPN server (no pending request).")
+    try:
+
+        if IP in packet:
+            src_ip = packet[IP].src
+            dst_ip = packet[IP].dst
+        elif IPv6 in packet:
+            src_ip = packet[IPv6].src
+            dst_ip = packet[IPv6].dst
+        else:
+            return
+
+        if not (is_same_subnet(src_ip, vpn_ip) or is_same_subnet(dst_ip, vpn_ip)):
+            return
+
+        if not packet.haslayer(UDP):
+            return
+
+        udp = packet[UDP]
+
+        is_wireguard = False
+        if hasattr(udp.payload, 'load') and isinstance(udp.payload.load, (bytes, bytearray)) and len(udp.payload.load) > 0:
+            first_byte = udp.payload.load[0]
+            is_wireguard = first_byte in (1, 2, 3, 4)
+
+        is_isakmp = (udp.sport == 500 or udp.dport == 500) and packet.haslayer(ISAKMP)
+
+        if not (is_wireguard or is_isakmp):
+            return
+
+        threading.Thread(
+            target=heavy_packet_handler,
+            args=(packet, src_ip, dst_ip, is_wireguard, is_isakmp),
+            daemon=True
+        ).start()
+
+    except Exception as e:
+        pass
 
 
+def heavy_packet_handler(packet, src_ip, dst_ip, is_wireguard, is_isakmp):
+    try:
+        summary = packet.summary()
+        logging.info(f"[PACKET DETECTED]: {summary}")
 
+        if is_isakmp:
+            isakmp_layer = packet[ISAKMP]
+            if isakmp_layer.next_payload != 0:
+                logging.info(f"[SKIPPED] Next Payload is {isakmp_layer.next_payload}")
+                return
+            bring_interfaces_down()
+            global stop_sniffing
+            stop_sniffing = True
+
+        elif is_wireguard:
+            global protocol, is_waiting_for_response, send_to_vpn_time
+            protocol = "WIREGUARD"
+
+            with state_lock:
+                if src_ip == my_ip and is_same_subnet(dst_ip, vpn_ip):
+                    if not is_waiting_for_response:
+                        send_to_vpn_time = time.time()
+                        is_waiting_for_response = True
+                        logging.info("[TIMER STARTED] First request sent...")
+                    else:
+                        logging.info("[IGNORED] Additional request...")
+
+                elif is_same_subnet(src_ip, vpn_ip) and dst_ip == my_ip:
+                    if is_waiting_for_response:
+                        is_waiting_for_response = False
+                        send_to_vpn_time = 0.0
+                        logging.info("[TIMER RESET] Response received.")
+                    else:
+                        logging.info("Unsolicited response...")
+
+    except Exception as e:
+        logging.error(f"Heavy handler error: {e}")
 
 def is_process_running(pid):
     try:
