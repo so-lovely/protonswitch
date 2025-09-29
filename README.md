@@ -16,3 +16,5 @@ Make sure protonvpn protol to be set IKEv2
 `sudo python3 protonswitch.py up`
 
 ### Tested on Mac. and go well on unix maybe?
+
+[Click program usage](https://youtu.be/_rYsRuRXgWg?si=v2L2piI_MF21cCkz)
